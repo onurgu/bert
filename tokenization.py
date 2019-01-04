@@ -21,6 +21,7 @@ from __future__ import print_function
 import collections
 import re
 import unicodedata
+import sentencepiece as spm
 import six
 import tensorflow as tf
 
@@ -156,6 +157,35 @@ def whitespace_tokenize(text):
     return []
   tokens = text.split()
   return tokens
+
+
+class SentencePieceTokenizer(object):
+  """Runs end-to-end tokenziation."""
+
+  def __init__(self, model_file):
+    # self.vocab = load_vocab(vocab_file)
+    # self.inv_vocab = {v: k for k, v in self.vocab.items()}
+    # self.basic_tokenizer = BasicTokenizer(do_lower_case=do_lower_case)
+    # self.wordpiece_tokenizer = WordpieceTokenizer(vocab=self.vocab)
+
+    self.tokenizer = spm.SentencePieceProcessor()
+    self.tokenizer.load(model_file)
+
+    self.vocab = {self.tokenizer.id_to_piece(i): i for i in range(self.tokenizer.get_piece_size())}
+
+  def tokenize(self, text):
+    text = convert_to_unicode(text)
+    output_tokens = self.tokenizer.EncodeAsPieces(text)
+
+    return output_tokens
+
+  def convert_tokens_to_ids(self, tokens):
+    return [self.tokenizer.piece_to_id(t) for t in tokens]
+    # return convert_by_vocab(self.vocab, tokens)
+
+  def convert_ids_to_tokens(self, ids):
+    return [self.tokenizer.id_to_piece(i) for i in ids]
+    # return convert_by_vocab(self.inv_vocab, ids)
 
 
 class FullTokenizer(object):
