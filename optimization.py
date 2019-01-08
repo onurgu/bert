@@ -18,6 +18,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import horovod.tensorflow as hvd
 import re
 import tensorflow as tf
 
@@ -30,7 +31,7 @@ def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps, use_tpu):
 
   # Implements linear decay of the learning rate.
   learning_rate = tf.train.polynomial_decay(
-      learning_rate,
+      learning_rate * hvd.size(),
       global_step,
       num_train_steps,
       end_learning_rate=0.0,
@@ -51,13 +52,13 @@ def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps, use_tpu):
 
     is_warmup = tf.cast(global_steps_int < warmup_steps_int, tf.float32)
     learning_rate = (
-        (1.0 - is_warmup) * learning_rate + is_warmup * warmup_learning_rate)
+        (1.0 - is_warmup) * learning_rate + is_warmup * warmup_learning_rate) * hvd.size()
 
   # It is recommended that you use this optimizer for fine tuning, since this
   # is how the model was trained (note that the Adam m/v variables are NOT
   # loaded from init_checkpoint.)
   optimizer = AdamWeightDecayOptimizer(
-      learning_rate=learning_rate,
+      learning_rate=learning_rate * hvd.size(),
       weight_decay_rate=0.01,
       beta_1=0.9,
       beta_2=0.999,
@@ -66,6 +67,8 @@ def create_optimizer(loss, init_lr, num_train_steps, num_warmup_steps, use_tpu):
 
   if use_tpu:
     optimizer = tf.contrib.tpu.CrossShardOptimizer(optimizer)
+
+  optimizer = hvd.DistributedOptimizer(optimizer)
 
   tvars = tf.trainable_variables()
   grads = tf.gradients(loss, tvars)

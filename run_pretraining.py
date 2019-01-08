@@ -18,6 +18,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import horovod.tensorflow as hvd
 import os
 import modeling
 import optimization
@@ -404,18 +405,40 @@ def _decode_record(record, name_to_features):
 
 
 def main(_):
+
+  # Initialize Horovod
+  hvd.init()
+
   tf.logging.set_verbosity(tf.logging.INFO)
 
   if not FLAGS.do_train and not FLAGS.do_eval:
     raise ValueError("At least one of `do_train` or `do_eval` must be True.")
 
+  gpu_config = tf.ConfigProto()
+  gpu_config.gpu_options.allow_growth = True
+  gpu_config.gpu_options.visible_device_list = str(hvd.local_rank())
+
   bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
 
-  tf.gfile.MakeDirs(FLAGS.output_dir)
+  if hvd.rank() == 0:
+    tf.gfile.MakeDirs(FLAGS.output_dir)
 
   input_files = []
   for input_pattern in FLAGS.input_file.split(","):
     input_files.extend(tf.gfile.Glob(input_pattern))
+
+  import math
+  all_input_files = list(input_files)
+  input_files = []
+  n_input_files_for_each_worker = int(math.ceil(len(all_input_files)/hvd.size()))
+
+  tf.logging.info("*** Truncating Input Files For This Worker ***")
+  for i in range(n_input_files_for_each_worker):
+    input_file_idx = hvd.rank() * n_input_files_for_each_worker + i
+    if input_file_idx < len(all_input_files):
+        input_files.append(all_input_files[input_file_idx])
+    else:
+        break
 
   tf.logging.info("*** Input Files ***")
   for input_file in input_files:
@@ -435,7 +458,8 @@ def main(_):
       tpu_config=tf.contrib.tpu.TPUConfig(
           iterations_per_loop=FLAGS.iterations_per_loop,
           num_shards=FLAGS.num_tpu_cores,
-          per_host_input_for_training=is_per_host))
+          per_host_input_for_training=is_per_host),
+      session_config=gpu_config)
 
   model_fn = model_fn_builder(
       bert_config=bert_config,
@@ -463,14 +487,15 @@ def main(_):
         max_seq_length=FLAGS.max_seq_length,
         max_predictions_per_seq=FLAGS.max_predictions_per_seq,
         is_training=True)
-    estimator.train(input_fn=train_input_fn, max_steps=FLAGS.num_train_steps)
+    hooks = [hvd.BroadcastGlobalVariablesHook(0)]
+    estimator.train(input_fn=train_input_fn, max_steps=FLAGS.num_train_steps // hvd.size(), hooks=hooks)
 
-  if FLAGS.do_eval:
+  if FLAGS.do_eval and hvd.rank() == 0:
     tf.logging.info("***** Running evaluation *****")
     tf.logging.info("  Batch size = %d", FLAGS.eval_batch_size)
 
     eval_input_fn = input_fn_builder(
-        input_files=input_files,
+        input_files=all_input_files,
         max_seq_length=FLAGS.max_seq_length,
         max_predictions_per_seq=FLAGS.max_predictions_per_seq,
         is_training=False)
