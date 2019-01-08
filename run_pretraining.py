@@ -82,6 +82,8 @@ flags.DEFINE_integer("max_eval_steps", 100, "Maximum number of eval steps.")
 
 flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
 
+flags.DEFINE_bool("use_horovod", False, "Whether to use Horovod.")
+
 tf.flags.DEFINE_string(
     "tpu_name", None,
     "The Cloud TPU to use for training. This should be either the name "
@@ -406,8 +408,9 @@ def _decode_record(record, name_to_features):
 
 def main(_):
 
-  # Initialize Horovod
-  hvd.init()
+  if FLAGS.use_horovod:
+      # Initialize Horovod
+      hvd.init()
 
   tf.logging.set_verbosity(tf.logging.INFO)
 
@@ -416,29 +419,31 @@ def main(_):
 
   gpu_config = tf.ConfigProto()
   gpu_config.gpu_options.allow_growth = True
-  gpu_config.gpu_options.visible_device_list = str(hvd.local_rank())
+  if FLAGS.use_horovod:
+    gpu_config.gpu_options.visible_device_list = str(hvd.local_rank())
 
   bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
 
-  if hvd.rank() == 0:
+  if hvd.rank() == 0 or not FLAGS.use_horovod:
     tf.gfile.MakeDirs(FLAGS.output_dir)
 
   input_files = []
   for input_pattern in FLAGS.input_file.split(","):
     input_files.extend(tf.gfile.Glob(input_pattern))
 
-  import math
-  all_input_files = list(input_files)
-  input_files = []
-  n_input_files_for_each_worker = int(math.ceil(len(all_input_files)/hvd.size()))
+  if FLAGS.use_horovod:
+      import math
+      all_input_files = list(input_files)
+      input_files = []
+      n_input_files_for_each_worker = int(math.ceil(len(all_input_files)/hvd.size()))
 
-  tf.logging.info("*** Truncating Input Files For This Worker ***")
-  for i in range(n_input_files_for_each_worker):
-    input_file_idx = hvd.rank() * n_input_files_for_each_worker + i
-    if input_file_idx < len(all_input_files):
-        input_files.append(all_input_files[input_file_idx])
-    else:
-        break
+      tf.logging.info("*** Truncating Input Files For This Worker ***")
+      for i in range(n_input_files_for_each_worker):
+        input_file_idx = hvd.rank() * n_input_files_for_each_worker + i
+        if input_file_idx < len(all_input_files):
+            input_files.append(all_input_files[input_file_idx])
+        else:
+            break
 
   tf.logging.info("*** Input Files ***")
   for input_file in input_files:
@@ -454,7 +459,7 @@ def main(_):
       cluster=tpu_cluster_resolver,
       master=FLAGS.master,
       model_dir=FLAGS.output_dir,
-      save_checkpoints_steps=FLAGS.save_checkpoints_steps if hvd.rank() == 0 else None,
+      save_checkpoints_steps=(FLAGS.save_checkpoints_steps if hvd.rank() == 0 else None) if FLAGS.use_horovod else FLAGS.save_checkpoints_steps,
       save_checkpoints_secs = None,
       tpu_config=tf.contrib.tpu.TPUConfig(
           iterations_per_loop=FLAGS.iterations_per_loop,
@@ -488,10 +493,15 @@ def main(_):
         max_seq_length=FLAGS.max_seq_length,
         max_predictions_per_seq=FLAGS.max_predictions_per_seq,
         is_training=True)
-    hooks = [hvd.BroadcastGlobalVariablesHook(0)]
-    estimator.train(input_fn=train_input_fn, max_steps=FLAGS.num_train_steps // hvd.size(), hooks=hooks)
+    if FLAGS.use_horovod:
+        hooks = [hvd.BroadcastGlobalVariablesHook(0)]
+    else:
+        hooks = None
+    estimator.train(input_fn=train_input_fn,
+                    max_steps=(FLAGS.num_train_steps // hvd.size()) if FLAGS.use_horovod else FLAGS.num_train_steps,
+                    hooks=hooks)
 
-  if FLAGS.do_eval and hvd.rank() == 0:
+  if FLAGS.do_eval and (hvd.rank() == 0 or not FLAGS.use_horovod):
     tf.logging.info("***** Running evaluation *****")
     tf.logging.info("  Batch size = %d", FLAGS.eval_batch_size)
 
