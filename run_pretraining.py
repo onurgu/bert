@@ -411,6 +411,9 @@ def main(_):
   if FLAGS.use_horovod:
       # Initialize Horovod
       hvd.init()
+      hvd_rank = hvd.rank()
+  else:
+      hvd_rank = 0
 
   tf.logging.set_verbosity(tf.logging.INFO)
 
@@ -424,7 +427,7 @@ def main(_):
 
   bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
 
-  if hvd.rank() == 0 or not FLAGS.use_horovod:
+  if not FLAGS.use_horovod or hvd_rank == 0:
     tf.gfile.MakeDirs(FLAGS.output_dir)
 
   input_files = []
@@ -459,12 +462,13 @@ def main(_):
       cluster=tpu_cluster_resolver,
       master=FLAGS.master,
       model_dir=FLAGS.output_dir,
-      save_checkpoints_steps=(FLAGS.save_checkpoints_steps if hvd.rank() == 0 else None) if FLAGS.use_horovod else FLAGS.save_checkpoints_steps,
+      save_checkpoints_steps=(FLAGS.save_checkpoints_steps if hvd_rank == 0 else None) if FLAGS.use_horovod else FLAGS.save_checkpoints_steps,
       save_checkpoints_secs = None,
       tpu_config=tf.contrib.tpu.TPUConfig(
           iterations_per_loop=FLAGS.iterations_per_loop,
           num_shards=FLAGS.num_tpu_cores,
-          per_host_input_for_training=is_per_host),
+          per_host_input_for_training=is_per_host,
+          initial_infeed_sleep_secs=FLAGS.initial_infeed_sleep_secs),
       session_config=gpu_config)
 
   model_fn = model_fn_builder(
@@ -501,12 +505,12 @@ def main(_):
                     max_steps=(FLAGS.num_train_steps // hvd.size()) if FLAGS.use_horovod else FLAGS.num_train_steps,
                     hooks=hooks)
 
-  if FLAGS.do_eval and (hvd.rank() == 0 or not FLAGS.use_horovod):
+  if FLAGS.do_eval and (hvd_rank == 0 or not FLAGS.use_horovod):
     tf.logging.info("***** Running evaluation *****")
     tf.logging.info("  Batch size = %d", FLAGS.eval_batch_size)
 
     eval_input_fn = input_fn_builder(
-        input_files=all_input_files,
+        input_files=all_input_files if FLAGS.use_horovod else input_files,
         max_seq_length=FLAGS.max_seq_length,
         max_predictions_per_seq=FLAGS.max_predictions_per_seq,
         is_training=False)
