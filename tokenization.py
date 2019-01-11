@@ -21,7 +21,10 @@ from __future__ import print_function
 import collections
 import re
 import unicodedata
-import sentencepiece as spm
+try:
+  import sentencepiece as spm
+except ImportError:
+  pass
 import six
 import tensorflow as tf
 
