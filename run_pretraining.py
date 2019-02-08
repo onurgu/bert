@@ -18,6 +18,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import horovod.tensorflow as hvd
 import os
 import modeling
 import optimization
@@ -59,6 +60,8 @@ flags.DEFINE_integer(
 
 flags.DEFINE_bool("do_train", False, "Whether to run training.")
 
+flags.DEFINE_bool("no_nsp", False, "Do not use Next Sentence Prediction (NSP) Task")
+
 flags.DEFINE_bool("do_eval", False, "Whether to run eval on the dev set.")
 
 flags.DEFINE_integer("train_batch_size", 32, "Total batch size for training.")
@@ -77,9 +80,14 @@ flags.DEFINE_integer("save_checkpoints_steps", 1000,
 flags.DEFINE_integer("iterations_per_loop", 1000,
                      "How many steps to make in each estimator call.")
 
+flags.DEFINE_integer("initial_infeed_sleep_secs", 600,
+                     "xyz.")
+
 flags.DEFINE_integer("max_eval_steps", 100, "Maximum number of eval steps.")
 
 flags.DEFINE_bool("use_tpu", False, "Whether to use TPU or GPU/CPU.")
+
+flags.DEFINE_bool("use_horovod", False, "Whether to use Horovod.")
 
 tf.flags.DEFINE_string(
     "tpu_name", None,
@@ -108,7 +116,7 @@ flags.DEFINE_integer(
 
 def model_fn_builder(bert_config, init_checkpoint, learning_rate,
                      num_train_steps, num_warmup_steps, use_tpu,
-                     use_one_hot_embeddings):
+                     use_one_hot_embeddings, no_nsp=False):
   """Returns `model_fn` closure for TPUEstimator."""
 
   def model_fn(features, labels, mode, params):  # pylint: disable=unused-argument
@@ -145,7 +153,10 @@ def model_fn_builder(bert_config, init_checkpoint, learning_rate,
      next_sentence_log_probs) = get_next_sentence_output(
          bert_config, model.get_pooled_output(), next_sentence_labels)
 
-    total_loss = masked_lm_loss + next_sentence_loss
+    if no_nsp:
+        total_loss = masked_lm_loss
+    else:
+        total_loss = masked_lm_loss + next_sentence_loss
 
     tvars = tf.trainable_variables()
 
@@ -404,18 +415,46 @@ def _decode_record(record, name_to_features):
 
 
 def main(_):
+
+  if FLAGS.use_horovod:
+      # Initialize Horovod
+      hvd.init()
+      hvd_rank = hvd.rank()
+  else:
+      hvd_rank = 0
+
   tf.logging.set_verbosity(tf.logging.INFO)
 
   if not FLAGS.do_train and not FLAGS.do_eval:
     raise ValueError("At least one of `do_train` or `do_eval` must be True.")
 
+  gpu_config = tf.ConfigProto()
+  gpu_config.gpu_options.allow_growth = True
+  if FLAGS.use_horovod:
+    gpu_config.gpu_options.visible_device_list = str(hvd.local_rank())
+
   bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
 
-  tf.gfile.MakeDirs(FLAGS.output_dir)
+  if not FLAGS.use_horovod or hvd_rank == 0:
+    tf.gfile.MakeDirs(FLAGS.output_dir)
 
   input_files = []
   for input_pattern in FLAGS.input_file.split(","):
     input_files.extend(tf.gfile.Glob(input_pattern))
+
+  if FLAGS.use_horovod:
+      import math
+      all_input_files = list(input_files)
+      input_files = []
+      n_input_files_for_each_worker = int(math.ceil(len(all_input_files)/hvd.size()))
+
+      tf.logging.info("*** Truncating Input Files For This Worker ***")
+      for i in range(n_input_files_for_each_worker):
+        input_file_idx = hvd.rank() * n_input_files_for_each_worker + i
+        if input_file_idx < len(all_input_files):
+            input_files.append(all_input_files[input_file_idx])
+        else:
+            break
 
   tf.logging.info("*** Input Files ***")
   for input_file in input_files:
@@ -431,11 +470,14 @@ def main(_):
       cluster=tpu_cluster_resolver,
       master=FLAGS.master,
       model_dir=FLAGS.output_dir,
-      save_checkpoints_steps=FLAGS.save_checkpoints_steps,
+      save_checkpoints_steps=(FLAGS.save_checkpoints_steps if hvd_rank == 0 else None) if FLAGS.use_horovod else FLAGS.save_checkpoints_steps,
+      save_checkpoints_secs = None,
       tpu_config=tf.contrib.tpu.TPUConfig(
           iterations_per_loop=FLAGS.iterations_per_loop,
           num_shards=FLAGS.num_tpu_cores,
-          per_host_input_for_training=is_per_host))
+          per_host_input_for_training=is_per_host,
+          initial_infeed_sleep_secs=FLAGS.initial_infeed_sleep_secs),
+      session_config=gpu_config)
 
   model_fn = model_fn_builder(
       bert_config=bert_config,
@@ -444,7 +486,8 @@ def main(_):
       num_train_steps=FLAGS.num_train_steps,
       num_warmup_steps=FLAGS.num_warmup_steps,
       use_tpu=FLAGS.use_tpu,
-      use_one_hot_embeddings=FLAGS.use_tpu)
+      use_one_hot_embeddings=FLAGS.use_tpu,
+      no_nsp=FLAGS.no_nsp)
 
   # If TPU is not available, this will fall back to normal Estimator on CPU
   # or GPU.
@@ -463,14 +506,20 @@ def main(_):
         max_seq_length=FLAGS.max_seq_length,
         max_predictions_per_seq=FLAGS.max_predictions_per_seq,
         is_training=True)
-    estimator.train(input_fn=train_input_fn, max_steps=FLAGS.num_train_steps)
+    if FLAGS.use_horovod:
+        hooks = [hvd.BroadcastGlobalVariablesHook(0)]
+    else:
+        hooks = None
+    estimator.train(input_fn=train_input_fn,
+                    max_steps=(FLAGS.num_train_steps // hvd.size()) if FLAGS.use_horovod else FLAGS.num_train_steps,
+                    hooks=hooks)
 
-  if FLAGS.do_eval:
+  if FLAGS.do_eval and (hvd_rank == 0 or not FLAGS.use_horovod):
     tf.logging.info("***** Running evaluation *****")
     tf.logging.info("  Batch size = %d", FLAGS.eval_batch_size)
 
     eval_input_fn = input_fn_builder(
-        input_files=input_files,
+        input_files=all_input_files if FLAGS.use_horovod else input_files,
         max_seq_length=FLAGS.max_seq_length,
         max_predictions_per_seq=FLAGS.max_predictions_per_seq,
         is_training=False)
