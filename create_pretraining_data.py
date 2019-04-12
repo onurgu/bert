@@ -207,6 +207,8 @@ def create_training_instances(input_files, tokenizer, max_seq_length,
   instances = []
   for _ in range(dupe_factor):
     for document_index in range(len(all_documents)):
+      if document_index % 10000 == 0:
+        print("create_training_instances: document_index: %d" % document_index)
       instances.extend(
           create_instances_from_document(
               all_documents, document_index, max_seq_length, short_seq_prob,
